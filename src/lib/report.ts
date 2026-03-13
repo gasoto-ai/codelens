@@ -6,6 +6,7 @@ const categoryLabels: Record<Finding["category"], string> = {
   dependencies: "Dependencies",
   structure: "Structure & Config",
   docs: "Documentation",
+  coupling: "Dependency Coupling",
 }
 
 export function generateMarkdownReport(

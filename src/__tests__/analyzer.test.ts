@@ -308,3 +308,79 @@ describe("Metadata extraction", () => {
     expect(result.metadata.languages).toContain("TypeScript")
   })
 })
+
+// ─── Coupling analysis ────────────────────────────────────────────────────────
+
+describe("Coupling analysis", () => {
+  it("reports coupling-clean when no highly coupled files are found", async () => {
+    // Simple repo where no file is imported by 2+ others
+    setupMocks(
+      ["src/index.ts", "src/utils.ts", "src/server.ts"],
+      ({ path }: { path: string }) => {
+        if (path === "src/index.ts") {
+          return makeFileContent(`import { helper } from './utils'`)
+        }
+        return makeFileContent(`export const x = 1`)
+      }
+    )
+
+    const result = await analyzeRepo("owner", "repo")
+    const finding = result.findings.find((f) => f.id === "coupling-clean")
+    expect(finding).toBeDefined()
+    expect(finding?.category).toBe("coupling")
+  })
+
+  it("reports coupling-hubs when a file is imported by 2+ others", async () => {
+    // utils.ts imported by both page.ts and server.ts
+    setupMocks(
+      ["src/lib/utils.ts", "src/app/page.ts", "src/app/server.ts"],
+      ({ path }: { path: string }) => {
+        if (path === "src/app/page.ts") {
+          return makeFileContent(`import { helper } from '../lib/utils'`)
+        }
+        if (path === "src/app/server.ts") {
+          return makeFileContent(`import { helper } from '../lib/utils'`)
+        }
+        return makeFileContent(`export const helper = () => {}`)
+      }
+    )
+
+    const result = await analyzeRepo("owner", "repo")
+    const finding = result.findings.find((f) => f.id === "coupling-hubs")
+    expect(finding).toBeDefined()
+    expect(finding?.category).toBe("coupling")
+    expect(finding?.files?.[0]).toContain("src/lib/utils.ts")
+    expect(finding?.files?.[0]).toContain("2 importers")
+  })
+
+  it("coupling findings do not affect the score (info severity only)", async () => {
+    setupMocks(
+      [
+        "src/lib/utils.ts", "src/app/page.ts", "src/app/server.ts",
+        "src/index.test.ts", "tsconfig.json", ".eslintrc.json", ".prettierrc",
+        "README.md", "package.json",
+      ],
+      ({ path }: { path: string }) => {
+        if (path === "src/app/page.ts") {
+          return makeFileContent(`import { helper } from '../lib/utils'`)
+        }
+        if (path === "src/app/server.ts") {
+          return makeFileContent(`import { helper } from '../lib/utils'`)
+        }
+        if (path === "package.json") {
+          return makeFileContent(JSON.stringify({ dependencies: { next: "15.0.0" } }))
+        }
+        if (path === "README.md") {
+          return makeFileContent("# Project\n\n## Installation\n\nnpm install")
+        }
+        return makeFileContent(`export const helper = () => {}`)
+      }
+    )
+
+    const result = await analyzeRepo("owner", "repo")
+    const couplingFindings = result.findings.filter((f) => f.category === "coupling")
+    // All coupling findings should be info — no score impact
+    expect(couplingFindings.every((f) => f.severity === "info")).toBe(true)
+    expect(result.score).toBe(100)
+  })
+})

@@ -4,12 +4,24 @@ export type Severity = "critical" | "warn" | "info"
 
 export type Finding = {
   id: string
-  category: "typescript" | "testing" | "dependencies" | "structure" | "docs"
+  category: "typescript" | "testing" | "dependencies" | "structure" | "docs" | "coupling"
   severity: Severity
   title: string
   detail: string
   suggestion: string
   files?: string[]
+}
+
+export type DepNode = {
+  file: string
+  imports: string[]
+  importedBy: string[]
+}
+
+export type DependencyGraph = {
+  nodes: DepNode[]
+  hubFiles: Array<{ file: string; fanIn: number }>
+  orphanFiles: string[]
 }
 
 export type AnalysisResult = {
@@ -41,6 +53,122 @@ type GitHubFileContent = {
   content?: string
   encoding?: string
 }
+
+// ─── Dependency graph ──────────────────────────────────────────────────────────
+
+/**
+ * Parse internal import specifiers from a JS/TS file.
+ * Returns resolved file paths (matched against knownFiles) for relative imports.
+ * Handles @/ path aliases.
+ */
+export function parseInternalImports(
+  content: string,
+  fromFile: string,
+  knownFiles: string[]
+): string[] {
+  const results: string[] = []
+  // Matches: from './foo', require('./foo'), import './side-effect', from "@/bar"
+  const regex = /(?:from\s+|require\s*\(|import\s+)['"`]([^'"`\n]+)['"`]/g
+  let match
+
+  while ((match = regex.exec(content)) !== null) {
+    const specifier = match[1]
+
+    if (specifier.startsWith(".") || specifier.startsWith("/")) {
+      const resolved = resolveRelativePath(specifier, fromFile)
+      const matched = findMatchingFile(resolved, knownFiles)
+      if (matched) results.push(matched)
+    } else if (specifier.startsWith("@/")) {
+      // @/ typically maps to src/ in Next.js/TS projects — try both
+      const withSrc = "src/" + specifier.slice(2)
+      const withoutSrc = specifier.slice(2)
+      const matched = findMatchingFile(withSrc, knownFiles) ?? findMatchingFile(withoutSrc, knownFiles)
+      if (matched) results.push(matched)
+    }
+  }
+
+  return [...new Set(results)]
+}
+
+function resolveRelativePath(importPath: string, fromFile: string): string {
+  const dir = fromFile.includes("/")
+    ? fromFile.split("/").slice(0, -1).join("/")
+    : ""
+
+  const base = dir ? dir.split("/") : []
+  for (const seg of importPath.split("/")) {
+    if (seg === "..") base.pop()
+    else if (seg !== ".") base.push(seg)
+  }
+
+  return base.join("/")
+}
+
+function findMatchingFile(resolved: string, knownFiles: string[]): string | null {
+  if (knownFiles.includes(resolved)) return resolved
+
+  const extensions = [".ts", ".tsx", ".js", ".jsx"]
+  for (const ext of extensions) {
+    if (knownFiles.includes(resolved + ext)) return resolved + ext
+  }
+  for (const ext of extensions) {
+    const indexPath = `${resolved}/index${ext}`
+    if (knownFiles.includes(indexPath)) return indexPath
+  }
+
+  return null
+}
+
+/**
+ * Build a dependency graph from a map of file path → file content.
+ * Pure function — no I/O.
+ */
+export function buildDependencyGraph(
+  fileContents: Record<string, string>
+): DependencyGraph {
+  const allFiles = Object.keys(fileContents)
+
+  // Parse imports for each file
+  const importMap: Record<string, string[]> = {}
+  for (const [file, content] of Object.entries(fileContents)) {
+    importMap[file] = parseInternalImports(content, file, allFiles)
+  }
+
+  // Build reverse index (importedBy)
+  const importedByMap: Record<string, string[]> = {}
+  for (const file of allFiles) {
+    importedByMap[file] = []
+  }
+  for (const [file, imports] of Object.entries(importMap)) {
+    for (const imp of imports) {
+      if (importedByMap[imp]) {
+        importedByMap[imp].push(file)
+      }
+    }
+  }
+
+  const nodes: DepNode[] = allFiles.map((file) => ({
+    file,
+    imports: importMap[file] || [],
+    importedBy: importedByMap[file] || [],
+  }))
+
+  // Hub files: top 5 most imported (fan-in ≥ 2)
+  const hubFiles = [...nodes]
+    .filter((n) => n.importedBy.length >= 2)
+    .sort((a, b) => b.importedBy.length - a.importedBy.length)
+    .slice(0, 5)
+    .map((n) => ({ file: n.file, fanIn: n.importedBy.length }))
+
+  // Orphan files: not imported by anyone AND imports nothing
+  const orphanFiles = nodes
+    .filter((n) => n.importedBy.length === 0 && n.imports.length === 0)
+    .map((n) => n.file)
+
+  return { nodes, hubFiles, orphanFiles }
+}
+
+// ─── Main analysis ─────────────────────────────────────────────────────────────
 
 export async function analyzeRepo(owner: string, repo: string): Promise<AnalysisResult> {
   const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN })
@@ -88,7 +216,9 @@ export async function analyzeRepo(owner: string, repo: string): Promise<Analysis
   // Fetch key files
   let packageJson: Record<string, unknown> | null = null
   let readmeContent = ""
-  let largeFiles: string[] = []
+  const largeFiles: string[] = []
+  const classComponentFiles: string[] = []
+  const fetchedContents: Record<string, string> = {}
 
   if (hasPackageJson) {
     try {
@@ -114,30 +244,30 @@ export async function analyzeRepo(owner: string, repo: string): Promise<Analysis
     }
   }
 
-  // Check for large files (>500 lines) — sample a few TS/JS files
+  // Fetch sampled TS/JS files — used for:
+  //  1. Large file detection (via tree size, no fetch needed)
+  //  2. Class component detection (JSX/TSX files)
+  //  3. Dependency graph (import parsing)
   const sampleFiles = [...tsFiles, ...jsFiles].slice(0, 30)
-  for (const filePath of sampleFiles) {
-    try {
-      const fileItem = files.find((f) => f.path === filePath)
-      if (fileItem?.size && fileItem.size > 15000) {
-        // ~500 lines at ~30 chars/line
-        largeFiles.push(filePath)
-      }
-    } catch {
-      // ignore
-    }
-  }
 
-  // Check for class components in React files
-  const reactFiles = filePaths.filter((p) => /\.(jsx|tsx)$/.test(p))
-  const classComponentFiles: string[] = []
-  const sampleReact = reactFiles.slice(0, 20)
-  for (const filePath of sampleReact) {
+  for (const filePath of sampleFiles) {
+    const fileItem = files.find((f) => f.path === filePath)
+    if (fileItem?.size && fileItem.size > 15000) {
+      // ~500 lines at ~30 chars/line
+      largeFiles.push(filePath)
+    }
+
     try {
       const { data } = await octokit.repos.getContent({ owner, repo, path: filePath }) as { data: GitHubFileContent }
       if (data.content) {
         const content = Buffer.from(data.content, "base64").toString("utf-8")
-        if (/class\s+\w+\s+extends\s+(React\.Component|Component)/.test(content)) {
+        fetchedContents[filePath] = content
+
+        // Class component detection
+        if (
+          /\.(jsx|tsx)$/.test(filePath) &&
+          /class\s+\w+\s+extends\s+(React\.Component|Component)/.test(content)
+        ) {
           classComponentFiles.push(filePath)
         }
       }
@@ -145,6 +275,9 @@ export async function analyzeRepo(owner: string, repo: string): Promise<Analysis
       // ignore
     }
   }
+
+  // Build dependency graph from fetched contents
+  const depGraph = buildDependencyGraph(fetchedContents)
 
   // Parse deps
   const deps: Record<string, string> = {
@@ -328,16 +461,15 @@ export async function analyzeRepo(owner: string, repo: string): Promise<Analysis
       suggestion: "Ensure dependencies are committed in package.json.",
     })
   } else if (Object.keys(deps).length > 0) {
-    // Check for notoriously outdated patterns
     const legacyDeps: string[] = []
     const legacyPatterns = [
-      "react-scripts", // CRA
-      "moment", // replaced by date-fns/dayjs
-      "request", // deprecated HTTP lib
-      "node-fetch", // not needed in Node 18+
-      "tslint", // replaced by eslint
-      "enzyme", // replaced by testing-library
-      "redux", // not legacy but check for redux without toolkit
+      "react-scripts",
+      "moment",
+      "request",
+      "node-fetch",
+      "tslint",
+      "enzyme",
+      "redux",
     ]
 
     for (const dep of legacyPatterns) {
@@ -396,7 +528,7 @@ export async function analyzeRepo(owner: string, repo: string): Promise<Analysis
         id: "deps-legacy",
         category: "dependencies",
         severity: "warn",
-        title: `Potentially outdated dependencies`,
+        title: "Potentially outdated dependencies",
         detail: `Found: ${remainingLegacy.join(", ")}`,
         suggestion: "Review these dependencies for modern alternatives.",
       })
@@ -410,6 +542,45 @@ export async function analyzeRepo(owner: string, repo: string): Promise<Analysis
         title: "No major legacy dependencies detected",
         detail: `Scanned ${Object.keys(deps).length} dependencies.`,
         suggestion: "Run 'npm outdated' periodically to catch drift before it becomes a problem.",
+      })
+    }
+  }
+
+  // --- Coupling ---
+  if (Object.keys(fetchedContents).length > 0) {
+    if (depGraph.hubFiles.length > 0) {
+      const topHub = depGraph.hubFiles[0]
+      findings.push({
+        id: "coupling-hubs",
+        category: "coupling",
+        severity: "info",
+        title: `${depGraph.hubFiles.length} highly coupled file${depGraph.hubFiles.length > 1 ? "s" : ""} detected`,
+        detail: `"${topHub.file}" is imported by ${topHub.fanIn} other files. These are high-risk modules — changes here have a wide blast radius.`,
+        suggestion:
+          "Prioritize understanding and testing hub files before refactoring. Consider extracting shared types/interfaces to reduce coupling.",
+        files: depGraph.hubFiles.map((h) => `${h.file} (${h.fanIn} importers)`),
+      })
+    } else {
+      findings.push({
+        id: "coupling-clean",
+        category: "coupling",
+        severity: "info",
+        title: "No highly coupled files detected",
+        detail: `Analyzed ${Object.keys(fetchedContents).length} files. No single file is imported by more than 1 other file in the sample.`,
+        suggestion: "Good modular structure. Continue to keep modules focused and minimize cross-dependencies.",
+      })
+    }
+
+    if (depGraph.orphanFiles.length >= 3) {
+      findings.push({
+        id: "coupling-orphans",
+        category: "coupling",
+        severity: "info",
+        title: `${depGraph.orphanFiles.length} potentially unused files`,
+        detail: `These files have no imports and are not imported by any other analyzed file — possible dead code.`,
+        suggestion:
+          "Review these files. They may be entry points, build scripts, or dead code candidates for removal.",
+        files: depGraph.orphanFiles,
       })
     }
   }
@@ -437,7 +608,6 @@ export async function analyzeRepo(owner: string, repo: string): Promise<Analysis
 }
 
 function computeScore(findings: Finding[]): number {
-  // Start at 100, deduct for issues
   const deductions: Record<Severity, number> = {
     critical: 20,
     warn: 8,
