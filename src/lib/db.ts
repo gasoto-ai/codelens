@@ -2,6 +2,32 @@ import Database from "better-sqlite3"
 import path from "path"
 import fs from "fs"
 
+// ─── Exported types ────────────────────────────────────────────────────────────
+
+export type JobStatus = "pending" | "analyzing" | "complete" | "error"
+
+export type AnalysisJob = {
+  id: number
+  repo_url: string
+  owner: string
+  repo: string
+  status: JobStatus
+  error: string | null
+  score: number | null
+  findings: string | null  // JSON-serialised Finding[]
+  metadata: string | null  // JSON-serialised AnalysisResult["metadata"]
+  created_at: string
+  updated_at: string
+}
+
+/** AnalysisJob with findings and metadata already parsed */
+export type ParsedAnalysisJob = Omit<AnalysisJob, "findings" | "metadata"> & {
+  findings: import("./analyzer").Finding[] | null
+  metadata: import("./analyzer").AnalysisResult["metadata"] | null
+}
+
+// ─── DB singleton ──────────────────────────────────────────────────────────────
+
 const DB_PATH = path.join(process.cwd(), "data", "codelens.db")
 
 const dataDir = path.dirname(DB_PATH)
@@ -20,6 +46,8 @@ export function getDb(): Database.Database {
   }
   return _db
 }
+
+// ─── Schema ────────────────────────────────────────────────────────────────────
 
 function initSchema(db: Database.Database) {
   db.exec(`
