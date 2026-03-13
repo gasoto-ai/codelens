@@ -19,6 +19,7 @@ const categoryLabels: Record<Finding["category"], string> = {
   dependencies: "Dependencies",
   structure: "Structure & Config",
   docs: "Documentation",
+  coupling: "Dependency Coupling",
 }
 
 const severityConfig = {
