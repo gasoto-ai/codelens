@@ -42,9 +42,8 @@ type GitHubFileContent = {
   encoding?: string
 }
 
-const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN })
-
 export async function analyzeRepo(owner: string, repo: string): Promise<AnalysisResult> {
+  const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN })
   // Get the full file tree
   const { data: repoData } = await octokit.repos.get({ owner, repo })
   const defaultBranch = repoData.default_branch
